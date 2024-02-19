@@ -95,7 +95,7 @@ async def analyze_emotion_and_build_prompt(chunks, transcription_segments):
                 emotions = result['prosody']['predictions'][0]['emotions']
                 sorted_emotions = sorted(emotions, key=lambda x: x['score'], reverse=True)[:3]  # Top 3 emotions
                 emotion_str = ", ".join([f"[{emotion['name']}: {emotion['score']:.2f}]" for emotion in sorted_emotions])
-                userPrompt += f"(Prosody Speech Emotions detected: {emotion_str}) {transcriptions} "
+                userPrompt += f"(Emotions detected: {emotion_str}) {transcriptions} "
 
             chunk_start_time += chunk_duration_ms
 
@@ -202,7 +202,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                          q
+    
 
 
   
