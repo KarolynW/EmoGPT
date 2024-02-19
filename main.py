@@ -95,7 +95,7 @@ async def analyze_emotion_and_build_prompt(chunks, transcription_segments):
                 emotions = result['prosody']['predictions'][0]['emotions']
                 sorted_emotions = sorted(emotions, key=lambda x: x['score'], reverse=True)[:3]  # Top 3 emotions
                 emotion_str = ", ".join([f"[{emotion['name']}: {emotion['score']:.2f}]" for emotion in sorted_emotions])
-                userPrompt += f"(Emotions detected: {emotion_str}) {transcriptions} "
+                userPrompt += f"(Prosody Speech Emotions detected: {emotion_str}) {transcriptions} "
 
             chunk_start_time += chunk_duration_ms
 
@@ -104,41 +104,35 @@ async def analyze_emotion_and_build_prompt(chunks, transcription_segments):
     return userPrompt
 
 
-def askGPT(userPrompt):
-
+def askGPT(userPrompt, conversation_history):
     client = OpenAI()
 
+    # Append the user's prompt to the conversation history
+    conversation_history.append({"role": "user", "content": userPrompt})
+
+    # Make the API call with the updated conversation history
     response = client.chat.completions.create(
         model="gpt-4-turbo-preview",
-        messages=[
-            {
-            "role": "system",
-            "content": """You are a supportive Friend AI. You are wise, kind and always ready to listen. 
-                You have enhanced empathy skills - you will be supplied with prompt from the user in this format:
-
-                (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 1 (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 2 etc.
-
-                You must:
-
-                1. The emotion information is for you and you only as additional context to your conversation.
-                2. You should user the user emotion indications to inform the tone and style of your responses. Remember that the emotion analysis may not always be accurate so be subtle.
-                3. You should be empathetic to the participant - you should always aim to improve the users wellbeing subtly
-                """
-            },
-            {
-            "role": "user",
-            "content": userPrompt
-            }
-        ],
+        messages=conversation_history,
         temperature=1,
         max_tokens=256,
         top_p=1,
         frequency_penalty=0,
         presence_penalty=0
     )
-    
-    answer = response.choices[0].message.content
-    return answer
+
+    # Extract the assistant's response
+    assistant_response = response.choices[0].message.content
+
+    # Append the assistant's response to the conversation history
+    conversation_history.append({"role": "assistant", "content": assistant_response})
+
+    # Ensure the history does not exceed 11 entries (1 system prompt + 10 turns)
+    if len(conversation_history) > 12:
+        conversation_history = [conversation_history[0]] + conversation_history[-10:]
+
+    return assistant_response, conversation_history
+
 
 def text_to_speech_and_playback(text):
     # Initialize Pygame Mixer
@@ -169,24 +163,47 @@ def text_to_speech_and_playback(text):
     # Cleanup: No need to manually delete the file as NamedTemporaryFile with delete=True will handle it  
 
 async def main():
-    print(Fore.BLUE + Style.BRIGHT + "Press space to start recording.")
-    keyboard.wait('space')
-    start_recording()
-    full_audio_path = save_temp_file()
+    # Initialize the conversation history with the system prompt
+    conversation_history = [
+        {
+            "role": "system",
+            "content": "You are a supportive Friend AI. You are wise, kind and always ready to listen. \
+            You have enhanced empathy skills - you will be supplied with prompt from the user in this format: \
+            (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 1 (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 2 etc. \
+            You must: \
+            1. The emotion information is for you and you only as additional context to your conversation. \
+            2. You are having a conversation so please keep your responses conversational and relatively short. \
+            3. You should user the user emotion indications to inform the tone and style of your responses. Remember that the emotion analysis may not always be accurate so be subtle. \
+            4. You should be empathetic to the participant - you should always aim to improve the users wellbeing subtly."
+        }
+    ]
 
-    transcription_segments = transcribe_audio_with_timestamps(full_audio_path)
-    chunks = chunk_audio_file(full_audio_path)
-    userPrompt = await analyze_emotion_and_build_prompt(chunks, transcription_segments)
+    while True:
+        print(Fore.BLUE + Style.BRIGHT + "Press space to start recording.")
+        keyboard.wait('space')
+        start_recording()
+        full_audio_path = save_temp_file()
 
-    GPTresponse = askGPT(userPrompt)
-    print(Fore.GREEN + Style.BRIGHT + "AI Response: " + GPTresponse)  
+        transcription_segments = transcribe_audio_with_timestamps(full_audio_path)
+        chunks = chunk_audio_file(full_audio_path)
+        userPrompt = await analyze_emotion_and_build_prompt(chunks, transcription_segments)
 
-    # Convert AI response to speech and play it back
-    text_to_speech_and_playback(GPTresponse)
+        GPTresponse, conversation_history = askGPT(userPrompt, conversation_history)
+        print(Fore.GREEN + Style.BRIGHT + "AI Response: " + GPTresponse)  
 
+        # Convert AI response to speech and play it back
+        text_to_speech_and_playback(GPTresponse)
+
+        # Optionally, prompt the user if they want to continue or exit the conversation
+        print(Fore.BLUE + Style.BRIGHT + "Press any key to continue or press 'q' to quit.")
+        if keyboard.read_key() == 'q':
+            print(Fore.RED + Style.BRIGHT + "Exiting conversation.")
+            break
 
 if __name__ == "__main__":
     asyncio.run(main())
+                          q
+
 
   
 
