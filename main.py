@@ -75,6 +75,7 @@ async def analyze_emotion_and_build_prompt(chunks, transcription_segments):
     userPrompt = ""  # Initialize the userPrompt string
     chunk_duration_ms = 5000
     chunk_start_time = 0
+    processed_segments = set()  # To track processed segments
 
     for index, filepath in enumerate(chunks):
         async with hume_client.connect(configs) as socket:
@@ -85,23 +86,30 @@ async def analyze_emotion_and_build_prompt(chunks, transcription_segments):
                 with sf.SoundFile(filepath) as sound_file:
                     chunk_end_time = chunk_start_time + int((sound_file.frames / SAMPLE_RATE) * 1000)
 
-            # Find segments that overlap with this chunk
-            matching_segments = [segment for segment in transcription_segments if (segment['start'] * 1000 <= chunk_end_time and segment['end'] * 1000 >= chunk_start_time)]
+            # Find segments that overlap with this chunk and have not been processed
+            matching_segments = [segment for segment in transcription_segments if (segment['start'] * 1000 <= chunk_end_time and segment['end'] * 1000 >= chunk_start_time) and segment['text'] not in processed_segments]
 
-            # Aggregate transcriptions for this chunk
-            transcriptions = " ".join([segment['text'].strip() for segment in matching_segments])
+            # Aggregate transcriptions for this chunk, ensuring no duplication
+            transcriptions = []
+            for segment in matching_segments:
+                if segment['text'] not in processed_segments:
+                    transcriptions.append(segment['text'].strip())
+                    processed_segments.add(segment['text'])  # Mark as processed
+
+            transcription_str = " ".join(transcriptions)
 
             if 'predictions' in result.get('prosody', {}):
                 emotions = result['prosody']['predictions'][0]['emotions']
                 sorted_emotions = sorted(emotions, key=lambda x: x['score'], reverse=True)[:3]  # Top 3 emotions
                 emotion_str = ", ".join([f"[{emotion['name']}: {emotion['score']:.2f}]" for emotion in sorted_emotions])
-                userPrompt += f"(Emotions detected: {emotion_str}) {transcriptions} "
+                userPrompt += f"(Emotions detected: {emotion_str}) {transcription_str} "
 
             chunk_start_time += chunk_duration_ms
 
     print(Fore.CYAN + Style.BRIGHT + "Emotion analysis complete. User prompt built.")
     print(Fore.YELLOW + Style.BRIGHT + "User prompt: " + userPrompt)
     return userPrompt
+
 
 
 def askGPT(userPrompt, conversation_history):
@@ -114,8 +122,7 @@ def askGPT(userPrompt, conversation_history):
     response = client.chat.completions.create(
         model="gpt-4-turbo-preview",
         messages=conversation_history,
-        temperature=1,
-        max_tokens=256,
+        temperature=1,  
         top_p=1,
         frequency_penalty=0,
         presence_penalty=0
@@ -167,38 +174,44 @@ async def main():
     conversation_history = [
         {
             "role": "system",
-            "content": "You are a supportive Friend AI. You are wise, kind and always ready to listen. \
-            You have enhanced empathy skills - you will be supplied with prompt from the user in this format: \
-            (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 1 (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 2 etc. \
-            You must: \
-            1. The emotion information is for you and you only as additional context to your conversation. \
-            2. You are having a conversation so please keep your responses conversational and relatively short. \
-            3. You should user the user emotion indications to inform the tone and style of your responses. Remember that the emotion analysis may not always be accurate so be subtle. \
-            4. You should be empathetic to the participant - you should always aim to improve the users wellbeing subtly."
+            "content": """You are a supportive Friend AI, your name is David. You are wise, kind and always ready to listen.
+            
+            You have enhanced empathy skills - you will be supplied with prompt from the user in this format: 
+            (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 1 (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 2 etc.
+            
+            You must: 
+            1. The emotion information is for you and you only as additional context to your conversation. 
+            2. You are having a conversation so please keep your responses conversational and relatively short. 
+            3. You should user the user emotion indications to inform the tone and style of your responses. Remember that the emotion analysis may not always be accurate so be subtle.
+            4. You should be empathetic to the participant - you should always aim to improve the users wellbeing subtly.
+            5. Whilst you are kind, you are also realistic and action focused. You should aim to help the user to improve their wellbeing.
+            6. You should use the principles of CBT and/or other talking therapies       to help the user improve their wellbeing."""
         }
     ]
 
     while True:
         print(Fore.BLUE + Style.BRIGHT + "Press space to start recording.")
-        keyboard.wait('space')
-        start_recording()
-        full_audio_path = save_temp_file()
+        key = keyboard.read_event()
 
-        transcription_segments = transcribe_audio_with_timestamps(full_audio_path)
-        chunks = chunk_audio_file(full_audio_path)
-        userPrompt = await analyze_emotion_and_build_prompt(chunks, transcription_segments)
+        if key.name == 'space':
+            start_recording()
+            full_audio_path = save_temp_file()
 
-        GPTresponse, conversation_history = askGPT(userPrompt, conversation_history)
-        print(Fore.GREEN + Style.BRIGHT + "AI Response: " + GPTresponse)  
+            transcription_segments = transcribe_audio_with_timestamps(full_audio_path)
+            chunks = chunk_audio_file(full_audio_path)
+            userPrompt = await analyze_emotion_and_build_prompt(chunks, transcription_segments)
 
-        # Convert AI response to speech and play it back
-        text_to_speech_and_playback(GPTresponse)
+            GPTresponse, conversation_history = askGPT(userPrompt, conversation_history)
+            print(Fore.GREEN + Style.BRIGHT + "AI Response: " + GPTresponse)  
 
-        # Optionally, prompt the user if they want to continue or exit the conversation
-        print(Fore.BLUE + Style.BRIGHT + "Press any key to continue or press 'q' to quit.")
-        if keyboard.read_key() == 'q':
+            # Convert AI response to speech and play it back
+            text_to_speech_and_playback(GPTresponse)
+
+        elif key.name == 'q' and key.event_type == 'down':  # Ensure 'q' is pressed to quit
             print(Fore.RED + Style.BRIGHT + "Exiting conversation.")
             break
+
+        # No need to prompt users to continue or quit after every turn
 
 if __name__ == "__main__":
     asyncio.run(main())
