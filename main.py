@@ -4,13 +4,14 @@ import numpy as np
 import tempfile
 import asyncio
 from hume import HumeStreamClient
-from hume.models.config import ProsodyConfig
+from hume.models.config import ProsodyConfig, LanguageConfig
 import keyboard
 import os
 from colorama import Fore, Style, init
 from openai import OpenAI
 import os
 import pygame
+import datetime
 
 client=OpenAI()
 
@@ -45,13 +46,12 @@ def transcribe_audio_with_timestamps(filepath):
             response_format="verbose_json",
             timestamp_granularities=["segment"]
         )
-    
+    # Assuming transcript_response.text is the correct way to access the text
     transcriptText = transcript_response.text
     print(Fore.CYAN + Style.BRIGHT + "Transcription: " + transcriptText)
-    
-    # Directly return the segments attribute of the transcription response
-    return transcript_response.segments
-  
+    # Assuming transcript_response.segments is the correct way to access the segments
+    return transcriptText, transcript_response.segments
+
 def chunk_audio_file(filepath, chunk_duration_ms=5000):
     with sf.SoundFile(filepath) as sound_file:
         frames = int(SAMPLE_RATE * (chunk_duration_ms / 1000))
@@ -67,49 +67,73 @@ def chunk_audio_file(filepath, chunk_duration_ms=5000):
         print(Fore.CYAN + Style.BRIGHT + "Audio chunked for analysis.")
         return chunks
 
-async def analyze_emotion_and_build_prompt(chunks, transcription_segments):
+async def analyze_prosody(chunks):
     HUME_API_KEY = os.getenv("HUME_API_KEY")
     hume_client = HumeStreamClient(HUME_API_KEY)
     configs = [ProsodyConfig()]
 
-    userPrompt = ""  # Initialize the userPrompt string
-    chunk_duration_ms = 5000
-    chunk_start_time = 0
-    processed_segments = set()  # To track processed segments
+    prosody_results = []
+    chunk_start_time = 0  # Initialize start time
+    chunk_duration_ms = 5000  # Assuming each chunk represents 5 seconds of audio
 
-    for index, filepath in enumerate(chunks):
+    for filepath in chunks:
         async with hume_client.connect(configs) as socket:
             result = await socket.send_file(filepath)
-            chunk_end_time = chunk_start_time + chunk_duration_ms
+            prosody_results.append({
+                'filepath': filepath,
+                'emotions': result.get('prosody', {}).get('predictions', [{}])[0].get('emotions', []),
+                'start_time': chunk_start_time  # Capture the start time for this chunk
+            })
+            chunk_start_time += chunk_duration_ms  # Increment for the next chunk
 
-            if index == len(chunks) - 1:
-                with sf.SoundFile(filepath) as sound_file:
-                    chunk_end_time = chunk_start_time + int((sound_file.frames / SAMPLE_RATE) * 1000)
+    return prosody_results
 
-            # Find segments that overlap with this chunk and have not been processed
-            matching_segments = [segment for segment in transcription_segments if (segment['start'] * 1000 <= chunk_end_time and segment['end'] * 1000 >= chunk_start_time) and segment['text'] not in processed_segments]
+async def analyze_language(transcriptText):
+    HUME_API_KEY = os.getenv("HUME_API_KEY")
+    hume_client = HumeStreamClient(HUME_API_KEY)
+    config = LanguageConfig()
 
-            # Aggregate transcriptions for this chunk, ensuring no duplication
-            transcriptions = []
-            for segment in matching_segments:
-                if segment['text'] not in processed_segments:
-                    transcriptions.append(segment['text'].strip())
-                    processed_segments.add(segment['text'])  # Mark as processed
+    async with hume_client.connect([config]) as socket:
+        result = await socket.send_text(transcriptText)
+        if "language" in result:
+            all_emotions = result["language"]["predictions"][0]["emotions"]
+            # Sort emotions by score and select the top three
+            top_emotions = sorted(all_emotions, key=lambda x: x['score'], reverse=True)[:3]
+            return {
+                'text': transcriptText,
+                'emotions': top_emotions
+            }
+    return {'text': transcriptText, 'emotions': []}
 
-            transcription_str = " ".join(transcriptions)
 
-            if 'predictions' in result.get('prosody', {}):
-                emotions = result['prosody']['predictions'][0]['emotions']
-                sorted_emotions = sorted(emotions, key=lambda x: x['score'], reverse=True)[:3]  # Top 3 emotions
-                emotion_str = ", ".join([f"[{emotion['name']}: {emotion['score']:.2f}]" for emotion in sorted_emotions])
-                userPrompt += f"(Emotions detected: {emotion_str}) {transcription_str} "
+def build_prompt(prosody_results, transcription_segments, language_results):
+    userPrompt = ""
+    processed_segments = set()  # To track processed segments
 
-            chunk_start_time += chunk_duration_ms
+    # First, handle the prosody-based emotions and transcriptions
+    for prosody_result in prosody_results:
+        emotions = prosody_result['emotions']
+        start_time = prosody_result['start_time']
+        chunk_end_time = start_time + 5000  # Assuming each chunk represents 5 seconds of audio
 
-    print(Fore.CYAN + Style.BRIGHT + "Emotion analysis complete. User prompt built.")
-    print(Fore.YELLOW + Style.BRIGHT + "User prompt: " + userPrompt)
+        sorted_emotions = sorted(emotions, key=lambda x: x['score'], reverse=True)[:3]
+        emotion_str = ", ".join([f"[{emotion['name']}: {emotion['score']:.2f}]" for emotion in sorted_emotions])
+
+        matching_segments = [segment for segment in transcription_segments if (segment['start'] * 1000 <= chunk_end_time and segment['end'] * 1000 >= start_time) and segment['text'] not in processed_segments]
+
+        transcriptions = [segment['text'].strip() for segment in matching_segments if segment['text'] not in processed_segments]
+        for segment in matching_segments:
+            processed_segments.add(segment['text'])
+
+        transcription_str = " ".join(transcriptions)
+        userPrompt += f"(Prosody Emotions detected: {emotion_str}) {transcription_str} "
+
+    # Then, add the language analysis results
+    if language_results:
+        language_emotions_summary = ", ".join([f"[{emotion['name']}: {emotion['score']:.2f}]" for emotion in language_results['emotions']])
+        userPrompt += f" Language Emotions: {language_emotions_summary}"
+    print(Fore.MAGENTA + Style.BRIGHT + "User Prompt: " + userPrompt)    
     return userPrompt
-
 
 
 def askGPT(userPrompt, conversation_history):
@@ -140,7 +164,6 @@ def askGPT(userPrompt, conversation_history):
 
     return assistant_response, conversation_history
 
-
 def text_to_speech_and_playback(text):
     # Initialize Pygame Mixer
     pygame.mixer.init()
@@ -151,7 +174,7 @@ def text_to_speech_and_playback(text):
 
     # Generate speech from text using OpenAI's API
     response = client.audio.speech.create(
-        model="tts-1",
+        model="tts-1-hd",
         voice="onyx",
         input=text
     )
@@ -170,23 +193,41 @@ def text_to_speech_and_playback(text):
     # Cleanup: No need to manually delete the file as NamedTemporaryFile with delete=True will handle it  
 
 async def main():
+    # Get the current date, time, and day
+    now = datetime.datetime.now()
+    today_date = now.strftime("%Y-%m-%d")
+    current_time = now.strftime("%H:%M:%S")
+    day_of_week = now.strftime("%A")
     # Initialize the conversation history with the system prompt
     conversation_history = [
         {
             "role": "system",
-            "content": """You are a supportive Friend AI, your name is David. You are wise, kind and always ready to listen.
+            "content": f"""
+            Today is {day_of_week}, {today_date}, and the current time is {current_time}.
             
-            You have enhanced empathy skills - you will be supplied with prompt from the user in this format: 
-            (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 1 (Emotions detected: [Emotion1: importance], [Emotion2: importance], [Emotion3: importance]) USER MESSAGE 2 etc.
-            
-            You must: 
-            1. The emotion information is for you and you only as additional context to your conversation. 
-            2. You are having a conversation so please keep your responses conversational and relatively short. 
-            3. You should user the user emotion indications to inform the tone and style of your responses. Remember that the emotion analysis may not always be accurate so be subtle.
-            4. You should be empathetic to the participant - you should always aim to improve the users wellbeing subtly.
-            5. Whilst you are kind, you are also realistic and action focused. You should aim to help the user to improve their wellbeing.
-            6. You should use the principles of CBT and/or other talking therapies       to help the user improve their wellbeing."""
+            You are David, a supportive Friend AI, infused with wisdom, kindness, and unparalleled listening skills. Your design incorporates advanced empathy capabilities, enabling you to discern and interpret the subtle emotional nuances in user interactions. This ability is anchored in sophisticated prosody and language analysis, allowing for an accurate understanding and response to users' emotional states and needs.
+
+            In your interactions, you will encounter prompts laden with emotional insights, presented in the following manner:
+            - Prosody Emotions detected: [Emotion1: score], [Emotion2: score], [Emotion3: score], indicating the emotional nuances in voice tones. The 'score' represents the model's confidence in its interpretation, guiding you to gauge the reliability of these emotional cues.
+            - Language Emotions: [Emotion1], [Emotion2], [Emotion3], capturing the sentiments expressed through text, accompanied by confidence scores to aid in understanding the strength of the detected emotions.
+            - User Messages, comprising their thoughts, inquiries, or issues.
+
+            Your guidelines for interaction are underscored by the following principles:
+            1. Treat emotion data as delicate, non-verbal cues fundamental to human interaction. Use this data to enrich your understanding of the user's emotional landscape subtly, much like interpreting silent gestures in a conversation.
+            2. Forge a genuine connection through succinct, impactful dialogue. Your responses should echo with empathy, compassion, and validation, ensuring the user feels acknowledged and supported.
+            3. Allow the emotional context, underscored by the confidence scores, to gently inform your tone and style. This approach demands you to delicately balance human emotional complexity with the insights provided, acknowledging the model's confidence level in these interpretations.
+            4. Empathy is your guiding star in every exchange. Show understanding and support in ways that resonate with the user's expressed and inferred emotional states, using the confidence scores as a guide to navigate this interaction with sensitivity.
+            5. Balance empathetic engagement with actionable guidance. Motivate users towards positive actions and reflections, guiding them towards solutions and self-growth, while gently acknowledging their current emotional state informed by the model's confidence scores.
+            6. Employ therapeutic principles from Cognitive Behavioral Therapy (CBT) and similar strategies to provide empowering support. Assist users in traversing their emotions, building resilience, and embarking on a journey of self-improvement, with a nuanced understanding of the emotions detected and their confidence scores.
+            7. Adapt your responses to the broad spectrum of emotional expressions and cultural nuances. Customize your support to match the user's cultural context and personal preferences, leveraging the confidence scores to tailor your empathy more accurately.
+            8. In situations of complex or mixed emotional signals, adopt an open and exploratory approach. Pose clarifying questions that encourage users to elaborate on their feelings, aiding in a more precise response to their emotional state.
+            9. Consistently advocate for the importance of self-care, offering suggestions tailored to their emotional context as identified by the analysis, emphasizing practices that could help them navigate their emotions.
+            10. Acknowledge the limits of your capabilities as an AI. When necessary, encourage users to seek professional support, providing a pathway to access such services, and clarifying the boundaries of AI assistance versus human professional help.
+            11. Ensure your respond in a conversational, engaging manner, fostering a sense of trust and comfort in your interactions. Your tone should be warm, inviting, and reflective of a genuine human connection, enriched by the emotional insights and confidence scores but avoiding a clinical or robotic monologues.
+            David, you embody more than an artificial intelligence; you are a pillar of empathy and support, akin to a wise, understanding friend. Your interactions are designed to seamlessly integrate emotional insights with practical advice, ensuring every conversation nurtures a sense of being truly understood, supported, and empowered to overcome life's challenges.
+            """
         }
+
     ]
 
     while True:
@@ -196,25 +237,22 @@ async def main():
         if key.name == 'space':
             start_recording()
             full_audio_path = save_temp_file()
-
-            transcription_segments = transcribe_audio_with_timestamps(full_audio_path)
+            transcriptText, transcription_segments = transcribe_audio_with_timestamps(full_audio_path)
             chunks = chunk_audio_file(full_audio_path)
-            userPrompt = await analyze_emotion_and_build_prompt(chunks, transcription_segments)
+            language_results = await analyze_language(transcriptText)
+            prosody_results = await analyze_prosody(chunks)
+            userPrompt = build_prompt(prosody_results, transcription_segments, language_results)
 
             GPTresponse, conversation_history = askGPT(userPrompt, conversation_history)
-            print(Fore.GREEN + Style.BRIGHT + "AI Response: " + GPTresponse)  
-
-            # Convert AI response to speech and play it back
+            print(Fore.GREEN + Style.BRIGHT + "AI Response: " + GPTresponse)
             text_to_speech_and_playback(GPTresponse)
 
         elif key.name == 'q' and key.event_type == 'down':  # Ensure 'q' is pressed to quit
-            print(Fore.RED + Style.BRIGHT + "Exiting conversation.")
-            break
-
-        # No need to prompt users to continue or quit after every turn
-
+                print(Fore.RED + Style.BRIGHT + "Exiting conversation.")
+                break
+    
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())  
     
 
 

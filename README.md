@@ -1,4 +1,4 @@
-# Emotional Speech Assistant
+# EmoGPT
 
 This project is an innovative application that leverages advanced AI technologies to analyze emotions in spoken language, generate empathetic responses, and convert these responses into speech. It integrates various OpenAI models and other technologies to create a seamless interaction experience.
 
